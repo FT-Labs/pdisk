@@ -1,0 +1,159 @@
+#!/usr/bin/env python
+
+import os
+import subprocess
+import zlib
+from part_guids import *
+import uuid
+import tabulate
+
+def get_key_from_value(d, val):
+    return "".join([k for k, v in d.items() if v.lower() == val.lower()])
+
+class Partition:
+    def __init__(self, part_num, data):
+        self.part_num = part_num
+        self.parse_bin(data)
+
+    def parse_bin(self, data):
+        self.uguid_str = None
+        if data is None:
+            data = bytearray(128)
+            self.uguid_str = uuid.uuid4()
+        self.guid_str = None
+        self.guid_bin = [data[:4], data[4:6], data[6:8], data[8:16]]
+        self.uguid_bin = data[16:32]
+        first_lba_bin = data[32:40]
+        last_lba_bin  = data[40:48]
+        self.attr_flags_bin = data[48:56]
+        self.name_bin = data[56:]
+        self.guid_bin_str(self.guid_bin)
+        self.calculate_lba(first_lba_bin, last_lba_bin)
+
+    def guid_bin_str(self, guid):
+        g1 = hex(int.from_bytes(guid[0], 'little'))[2:].zfill(8)
+        g2 = hex(int.from_bytes(guid[1], 'little'))[2:].zfill(4)
+        g3 = hex(int.from_bytes(guid[2], 'little'))[2:].zfill(4)
+        g4 = hex(int.from_bytes(guid[3], 'big'))[2:].zfill(16)
+        self.guid_str = '-'.join([g1, g2, g3, g4[:4] + '-' + g4[4:]])
+
+    def str_guid_bin(self, guid):
+        b = b''
+        for idx, i in enumerate(guid.split('-')):
+            if idx < 3:
+                if idx == 0:
+                    b += bytearray.fromhex(f"{i[6:]}{i[4:6]}{i[2:4]}{i[0:2]}")
+                else:
+                    b += bytearray.fromhex(f"{i[2:]}{i[0:2]}")
+            else:
+                b += bytearray.fromhex(i)
+        return b
+
+    def calculate_lba(self, first_lba, last_lba):
+        self.first_lba = int.from_bytes(first_lba, 'little')
+        self.last_lba = int.from_bytes(last_lba, 'little')
+
+    def set_lba(self, first_lba, last_lba):
+        if first_lba != None:
+            self.first_lba = first_lba
+        if last_lba != None:
+            self.last_lba = last_lba
+
+    def set_lba_bin(self):
+        self.first_lba = int.to_bytes(self.first_lba, 8, 'little')
+        self.last_lba = int.to_bytes(self.last_lba, 8, 'little')
+
+    def finish(self):
+        self.set_lba_bin()
+        self.guid_bin = self.str_guid_bin(self.guid_str)
+        if self.uguid_str != None:
+            self.uguid_bin = self.str_guid_bin(self.uguid_str)
+        return bytes(self.guid_bin + self.uguid_bin + self.first_lba + self.last_lba + self.attr_flags_bin + self.name_bin)
+
+    def to_list(self, path):
+        rnd_gb = "{:.3f}".format((self.last_lba - self.first_lba) * 512 / 2**30)
+        return [ path, self.guid_str, get_key_from_value(part_map, self.guid_str),
+                  self.first_lba, self.last_lba,
+                 rnd_gb ]
+#self.first_lba * 512,
+#self.last_lba * 512,
+class GPT:
+    def __init__(self, dev_str):
+        self.debug_hex = False
+        self.dev_str = dev_str
+        self.size = 17408
+        self.mbr_size = 512
+        self.headerCRC = (528, 532)
+        self.table = self.get_table()
+        self.partCRC_calc = (1024, 17408)
+        self.partCRC = (600, 604)
+        self.headerCRC_calc = (512, 604)
+
+    def to_LE(self, be):
+        return bytes(bytearray.fromhex(hex(be)[2:].zfill(8))[::-1])
+
+    def get_table(self):
+        dev = os.open(self.dev_str, os.O_RDWR)
+        b = os.read(dev, self.size)
+        b = b[:self.headerCRC[0]] + b'\x00\x00\x00\x00' + b[self.headerCRC[1]:]
+        os.close(dev)
+        return bytearray(b)
+
+    def get_crc(self, crc):
+        h = (zlib.crc32(crc) & 0xffffffff)
+        if self.debug_hex == True:
+            print((self.to_LE(h)))
+        return self.to_LE(h)
+
+    def make_partitions(self):
+        self.partitions = []
+        p_num = 1
+        for i in range(self.partCRC_calc[0], self.partCRC_calc[1], 128):
+            if int.from_bytes(self.table[i:i+16], 'big') == 0:
+                p_num += 1
+                continue
+            self.partitions.append(Partition(p_num, self.table[i:i+128]))
+            p_num += 1
+
+    def print_partitions_tabular(self):
+        h = ["Dev Path", "GUID", "Guid Name", "Start Byte", "End Byte", "Size (GB)"]
+        tabular = []
+        for part in self.partitions:
+            if "nvme" in self.dev_str:
+                part_str = "{}p{}".format(self.dev_str, part.part_num)
+            else:
+                part_str = "{}{}".format(self.dev_str, part.part_num)
+            tabular.append(part.to_list(part_str))
+        print(tabulate.tabulate(tabular, headers=h, tablefmt="fancy_grid"))
+
+    def finish(self):
+        st = self.partCRC_calc[0]
+        for part in self.partitions:
+            self.table[st + part.part_num * 128:st + + part.part_num * 128 + 128] = part.finish()
+        self.table[self.partCRC[0]:self.partCRC[1]] = self.get_crc(self.table[self.partCRC_calc[0]:self.partCRC_calc[1]])
+        self.table[self.headerCRC[0]:self.headerCRC[1]] = self.get_crc(self.table[self.headerCRC_calc[0]:self.headerCRC_calc[1]])
+        dev = os.open(self.dev_str, os.O_WRONLY)
+        # os.write(dev, self.table)
+        # with open("dnm.out", "wb") as f:
+        #     f.write(self.table)
+
+
+
+def run_cmd_out(cmd):
+    return subprocess.check_output(cmd, text=True, shell=True).strip("\n").split("\n")
+
+# dev = os.open("/dev/nvme0n1", os.O_RDWR)
+
+devices = run_cmd_out("lsblk --nodeps --noheadings --paths --output=NAME")
+gpt_dev = []
+
+for d in devices:
+    gpt = GPT(d)
+    gpt.make_partitions()
+    gpt.print_partitions_tabular()
+    gpt_dev.append(d)
+
+# for i in gpt.partitions:
+#     print(i)
+#     with open("dnm.out", "wb") as f:
+#         f.write(i.finish())

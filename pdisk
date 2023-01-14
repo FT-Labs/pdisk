@@ -6,6 +6,41 @@ import zlib
 from part_guids import *
 import uuid
 import tabulate
+import cmd2
+import sys
+
+
+class Pdisk(cmd2.Cmd):
+    def __init__(self, gpt_dict):
+        self.gpt_dict = gpt_dict
+        super().__init__()
+        self.prompt_raw = "pdisk"
+        self.set_prompt(self.prompt_raw)
+
+    def set_prompt(self, prompt):
+        self.prompt_raw = prompt
+        self.prompt = cmd2.ansi.style(f"{prompt} >> ", fg=cmd2.Fg.BLUE, bg=None, bold=True)
+
+    dev_parser = cmd2.Cmd2ArgumentParser()
+    dev_parser.add_argument("print", help="Print devices", action="store_true")
+    dev_parser.add_argument("select", help="Print devices", action="store_true")
+
+    #@cmd2.with_argparser(dev_parser)
+    def do_dev(self, line):
+        d = ""
+        for idx, k in enumerate(self.gpt_dict.keys()):
+            d += f"{idx}: {k}\n"
+        self.poutput(cmd2.ansi.style(d, fg=cmd2.Fg.GREEN, bg=None))
+
+    def do_select(self, line):
+        try:
+            self.set_prompt(list(self.gpt_dict.keys())[int(line)])
+        except:
+            self.poutput(line)
+
+    def do_print(self, line):
+        self.poutput(self.gpt_dict[self.prompt_raw].partitions_tabular())
+
 
 def get_key_from_value(d, val):
     return "".join([k for k, v in d.items() if v.lower() == val.lower()])
@@ -115,7 +150,7 @@ class GPT:
             self.partitions.append(Partition(p_num, self.table[i:i+128]))
             p_num += 1
 
-    def print_partitions_tabular(self):
+    def partitions_tabular(self):
         h = ["Dev Path", "GUID", "Guid Name", "Start Byte", "End Byte", "Size (GB)"]
         tabular = []
         for part in self.partitions:
@@ -124,20 +159,18 @@ class GPT:
             else:
                 part_str = "{}{}".format(self.dev_str, part.part_num)
             tabular.append(part.to_list(part_str))
-        print(tabulate.tabulate(tabular, headers=h, tablefmt="fancy_grid"))
+        return tabulate.tabulate(tabular, headers=h, tablefmt="fancy_grid")
 
     def finish(self):
         st = self.partCRC_calc[0]
         for part in self.partitions:
-            self.table[st + part.part_num * 128:st + + part.part_num * 128 + 128] = part.finish()
+            self.table[st + (part.part_num - 1) * 128:st + + (part.part_num - 1) * 128 + 128] = part.finish()
         self.table[self.partCRC[0]:self.partCRC[1]] = self.get_crc(self.table[self.partCRC_calc[0]:self.partCRC_calc[1]])
         self.table[self.headerCRC[0]:self.headerCRC[1]] = self.get_crc(self.table[self.headerCRC_calc[0]:self.headerCRC_calc[1]])
         dev = os.open(self.dev_str, os.O_WRONLY)
-        # os.write(dev, self.table)
+        os.write(dev, self.table)
         # with open("dnm.out", "wb") as f:
         #     f.write(self.table)
-
-
 
 def run_cmd_out(cmd):
     return subprocess.check_output(cmd, text=True, shell=True).strip("\n").split("\n")
@@ -145,13 +178,19 @@ def run_cmd_out(cmd):
 # dev = os.open("/dev/nvme0n1", os.O_RDWR)
 
 devices = run_cmd_out("lsblk --nodeps --noheadings --paths --output=NAME")
-gpt_dev = []
+gpt_dev = {}
+gpt = GPT("/dev/sda")
+gpt.make_partitions()
+gpt.partitions[0].set_lba(None, 10726591)
+gpt.finish()
 
-for d in devices:
-    gpt = GPT(d)
-    gpt.make_partitions()
-    gpt.print_partitions_tabular()
-    gpt_dev.append(d)
+# for d in devices:
+#     gpt = GPT(d)
+#     gpt.make_partitions()
+#     gpt_dev[d] = gpt
+
+# app = Pdisk(gpt_dev)
+# sys.exit(app.cmdloop())
 
 # for i in gpt.partitions:
 #     print(i)

@@ -43,15 +43,13 @@ class Pdisk(cmd2.Cmd):
         """sel Choose device or partition (prompt)"""
         if self.prompt_raw == "pdisk":
             d = run_cmd_out('echo "{}" | gum choose'.format('\n'.join(list(self.gpt_dict.keys()))))[0]
-            self.poutput(cmd2.ansi.style(f"Disk succesfully selected.", fg=cmd2.Fg.GREEN, bg=None))
-            #self.set_prompt(list(self.gpt_dict.keys())[int(line)])
+            self.poutput(cmd2.ansi.style(f"{d} succesfully selected.", fg=cmd2.Fg.GREEN, bg=None))
             self.set_prompt(d)
         elif self.prompt_raw in self.gpt_dict.keys():
-            s = '\n'.join([n.part_name for n in self.gpt_dict[self.prompt_raw].partitions])
+            s = '\n'.join(list(self.gpt_dict[self.prompt_raw].partitions.keys()))
             d = run_cmd_out('echo "{}" | gum choose'.format(s))[0]
-            self.sel_partition = self.gpt_dict[self.prompt_raw].partitions[p_num]
-
-            self.poutput(cmd2.ansi.style(f"Partition  succesfully selected.", fg=cmd2.Fg.GREEN, bg=None))
+            self.sel_partition = self.gpt_dict[self.prompt_raw].partitions[d]
+            self.poutput(cmd2.ansi.style(f"{d} succesfully selected.", fg=cmd2.Fg.GREEN, bg=None))
             self.set_prompt(d)
 
     @cmd2.with_category("prompt")
@@ -68,7 +66,6 @@ class Pdisk(cmd2.Cmd):
     def do_r(self, line):
         """reset prompt and return to main menu without saving changes"""
         self.set_prompt("pdisk")
-
 
 def get_key_from_value(d, val):
     return "".join([k for k, v in d.items() if v.lower() == val.lower()])
@@ -134,10 +131,10 @@ class Partition:
             self.uguid_bin = self.str_guid_bin(self.uguid_str)
         return bytes(self.guid_bin + self.uguid_bin + self.first_lba + self.last_lba + self.attr_flags_bin + self.name_bin)
 
-    def to_list(self, path):
-        rnd_gb = "{:.3f}".format((self.last_lba - self.first_lba) * 512 / 2**30)
+    def to_list(self):
+        rnd_gb = "{:.3f}".format(((self.last_lba - self.first_lba) * 512)>>30)
         return [
-                cmd2.ansi.style(path, fg=cmd2.Fg.BLUE, bg=None),
+                cmd2.ansi.style(self.part_name, fg=cmd2.Fg.BLUE, bg=None),
                 # self.guid_str,
                 get_key_from_value(part_map, self.guid_str),
                 self.first_lba, self.last_lba,
@@ -160,6 +157,7 @@ class GPT:
         self.debug_hex = False
         self.dev_str = dev_str
         self.table = self.get_table()
+        self.last_block = run_cmd_out("cat /sys/class/block/{}/size".format(dev_str.split("/")[-1]))[0]
         self.first_lba, self.last_lba = self.get_first_last_lba()
 
     def to_LE(self, be):
@@ -189,7 +187,7 @@ class GPT:
         return self.to_LE(h)
 
     def make_partitions(self):
-        self.partitions = []
+        self.partitions = dict()
         p_num = 1
         for i in range(g.partCRC_calc[0], g.partCRC_calc[1], g.p_size):
             if int.from_bytes(self.table[i:i+16], 'big') == 0:
@@ -199,27 +197,28 @@ class GPT:
                 part_str = "{}p{}".format(self.dev_str, p_num)
             else:
                 part_str = "{}{}".format(self.dev_str, p_num)
-            self.partitions.append(Partition(part_str, p_num, self.table[i:i+g.p_size]))
+            self.partitions[part_str] = Partition(part_str, p_num, self.table[i:i+g.p_size])
             p_num += 1
 
     def partitions_tabular(self):
         #h = ["Path", "GUID", "Guid Name", "Start Sector", "End Sector", "Size (GB)", "Max Size (GB)"]
         h = ["Path", "Type", "Start Sector", "End Sector", "Size (GB)", "Max Size (GB)"]
         tabular = []
-        for idx, part in enumerate(self.partitions):
-            tabular.append(part.to_list(part.part_name))
-            if idx + 1 < len(self.partitions):
-                free = ((self.partitions[idx + 1].first_lba - part.first_lba - 1) * 512 / 2**30)
+        partitions = list(self.partitions.values())
+        for idx, part in enumerate(partitions):
+            tabular.append(part.to_list())
+            if idx + 1 < len(partitions):
+                free = (((partitions[idx + 1].first_lba - part.first_lba - 1) * 512)>>30)
             else:
-                free = ((self.last_lba - part.first_lba) * 512 / 2**30)
+                free = (((self.last_lba - part.first_lba) * 512)>>30)
             tabular[-1].append("{:.3f}".format(free))
 
         return tabulate.tabulate(tabular, headers=h, tablefmt="fancy_grid")
 
     def finish(self):
         st = g.partCRC_calc[0]
-        for part in self.partitions:
-            self.table[st + (part.part_num - 1) * g.p_size:st + + (part.part_num - 1) * g.p_size + g.p_size] = part.finish()
+        for part in list(self.partitions.values()):
+            self.table[st + (part.part_num - 1) * g.p_size:st + (part.part_num - 1) * g.p_size + g.p_size] = part.finish()
         self.table[g.partCRC[0]:g.partCRC[1]] = self.get_crc(self.table[g.partCRC_calc[0]:g.partCRC_calc[1]])
         self.table[g.headerCRC[0]:g.headerCRC[1]] = self.get_crc(self.table[g.headerCRC_calc[0]:g.headerCRC_calc[1]])
         dev = os.open(self.dev_str, os.O_WRONLY)

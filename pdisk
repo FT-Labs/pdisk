@@ -8,12 +8,23 @@ import uuid
 import tabulate
 import cmd2
 import sys
-
+import subprocess
 
 class Pdisk(cmd2.Cmd):
     def __init__(self, gpt_dict):
         self.gpt_dict = gpt_dict
+        self.sel_partition = None
         super().__init__()
+        del cmd2.Cmd.do_edit
+        del cmd2.Cmd.do_py
+        del cmd2.Cmd.do_set
+        del cmd2.Cmd.do_history
+        del cmd2.Cmd.do_macro
+        del cmd2.Cmd.do_shortcuts
+        del cmd2.Cmd.do_alias
+        del cmd2.Cmd.do_shell
+        del cmd2.Cmd.do_run_script
+        del cmd2.Cmd.do_run_pyscript
         self.prompt_raw = "pdisk"
         self.set_prompt(self.prompt_raw)
 
@@ -22,31 +33,49 @@ class Pdisk(cmd2.Cmd):
         self.prompt = cmd2.ansi.style(f"{prompt} >> ", fg=cmd2.Fg.BLUE, bg=None, bold=True)
 
     dev_parser = cmd2.Cmd2ArgumentParser()
-    dev_parser.add_argument("print", help="Print devices", action="store_true")
-    dev_parser.add_argument("select", help="Print devices", action="store_true")
 
     #@cmd2.with_argparser(dev_parser)
-    def do_dev(self, line):
-        d = ""
-        for idx, k in enumerate(self.gpt_dict.keys()):
-            d += f"{idx}: {k}\n"
-        self.poutput(cmd2.ansi.style(d, fg=cmd2.Fg.GREEN, bg=None))
+    # @cmd2.with_category("devices")
+    # def do_dev(self, line):
 
-    def do_select(self, line):
-        try:
-            self.set_prompt(list(self.gpt_dict.keys())[int(line)])
-        except:
-            self.poutput(line)
+    @cmd2.with_category("sel")
+    def do_sel(self, line):
+        """sel Choose device or partition (prompt)"""
+        if self.prompt_raw == "pdisk":
+            d = run_cmd_out('echo "{}" | gum choose'.format('\n'.join(list(self.gpt_dict.keys()))))[0]
+            self.poutput(cmd2.ansi.style(f"Disk succesfully selected.", fg=cmd2.Fg.GREEN, bg=None))
+            #self.set_prompt(list(self.gpt_dict.keys())[int(line)])
+            self.set_prompt(d)
+        elif self.prompt_raw in self.gpt_dict.keys():
+            s = '\n'.join([n.part_name for n in self.gpt_dict[self.prompt_raw].partitions])
+            d = run_cmd_out('echo "{}" | gum choose'.format(s))[0]
+            self.sel_partition = self.gpt_dict[self.prompt_raw].partitions[p_num]
 
+            self.poutput(cmd2.ansi.style(f"Partition  succesfully selected.", fg=cmd2.Fg.GREEN, bg=None))
+            self.set_prompt(d)
+
+    @cmd2.with_category("prompt")
     def do_print(self, line):
-        self.poutput(self.gpt_dict[self.prompt_raw].partitions_tabular())
+        """print devices or partitions according to selected (prompt)"""
+        if self.prompt_raw == "pdisk":
+            d = ""
+            for idx, k in enumerate(self.gpt_dict.keys()):
+                d += f"{idx}: {k}\n"
+            self.poutput(cmd2.ansi.style(d, fg=cmd2.Fg.GREEN, bg=None))
+        elif self.prompt_raw in self.gpt_dict.keys():
+            self.poutput(self.gpt_dict[self.prompt_raw].partitions_tabular())
+
+    def do_r(self, line):
+        """reset prompt and return to main menu without saving changes"""
+        self.set_prompt("pdisk")
 
 
 def get_key_from_value(d, val):
     return "".join([k for k, v in d.items() if v.lower() == val.lower()])
 
 class Partition:
-    def __init__(self, part_num, data):
+    def __init__(self, part_name, part_num, data):
+        self.part_name = part_name
         self.part_num = part_num
         self.parse_bin(data)
 
@@ -107,30 +136,49 @@ class Partition:
 
     def to_list(self, path):
         rnd_gb = "{:.3f}".format((self.last_lba - self.first_lba) * 512 / 2**30)
-        return [ path, self.guid_str, get_key_from_value(part_map, self.guid_str),
-                  self.first_lba, self.last_lba,
-                 rnd_gb ]
+        return [
+                cmd2.ansi.style(path, fg=cmd2.Fg.BLUE, bg=None),
+                # self.guid_str,
+                get_key_from_value(part_map, self.guid_str),
+                self.first_lba, self.last_lba,
+                cmd2.ansi.style(rnd_gb, fg=cmd2.Fg.LIGHT_GREEN, bg=None) ]
 #self.first_lba * 512,
 #self.last_lba * 512,
+class g:
+    size = 17408
+    p_size = 128
+    mbr_offset = 512
+    headerCRC = (528, 532)
+    partCRC_calc = (1024, 17408)
+    partCRC = (600, 604)
+    headerCRC_calc = (512, 604)
+    first_usable_lba = (552, 560)
+    last_usable_lba = (560, 568)
+
 class GPT:
     def __init__(self, dev_str):
         self.debug_hex = False
         self.dev_str = dev_str
-        self.size = 17408
-        self.mbr_size = 512
-        self.headerCRC = (528, 532)
         self.table = self.get_table()
-        self.partCRC_calc = (1024, 17408)
-        self.partCRC = (600, 604)
-        self.headerCRC_calc = (512, 604)
+        self.first_lba, self.last_lba = self.get_first_last_lba()
 
     def to_LE(self, be):
         return bytes(bytearray.fromhex(hex(be)[2:].zfill(8))[::-1])
 
+    def confirm_table(self):
+        if self.get_crc(self.table[g.headerCRC_calc[0]:g.headerCRC_calc[1]]) != self.orig_header_crc:
+            print("GPT table corrupt...")
+            exit(1)
+
+    def get_first_last_lba(self):
+        return int.from_bytes(self.table[g.first_usable_lba[0]:g.first_usable_lba[1]], 'little'), \
+               int.from_bytes(self.table[g.last_usable_lba[0]:g.last_usable_lba[1]], 'little')
+
     def get_table(self):
         dev = os.open(self.dev_str, os.O_RDWR)
-        b = os.read(dev, self.size)
-        b = b[:self.headerCRC[0]] + b'\x00\x00\x00\x00' + b[self.headerCRC[1]:]
+        b = os.read(dev, g.size)
+        self.orig_header_crc = b[g.headerCRC[0]:g.headerCRC[1]]
+        b = b[:g.headerCRC[0]] + b'\x00\x00\x00\x00' + b[g.headerCRC[1]:]
         os.close(dev)
         return bytearray(b)
 
@@ -143,30 +191,37 @@ class GPT:
     def make_partitions(self):
         self.partitions = []
         p_num = 1
-        for i in range(self.partCRC_calc[0], self.partCRC_calc[1], 128):
+        for i in range(g.partCRC_calc[0], g.partCRC_calc[1], g.p_size):
             if int.from_bytes(self.table[i:i+16], 'big') == 0:
                 p_num += 1
                 continue
-            self.partitions.append(Partition(p_num, self.table[i:i+128]))
+            if "nvme" in self.dev_str:
+                part_str = "{}p{}".format(self.dev_str, p_num)
+            else:
+                part_str = "{}{}".format(self.dev_str, p_num)
+            self.partitions.append(Partition(part_str, p_num, self.table[i:i+g.p_size]))
             p_num += 1
 
     def partitions_tabular(self):
-        h = ["Dev Path", "GUID", "Guid Name", "Start Byte", "End Byte", "Size (GB)"]
+        #h = ["Path", "GUID", "Guid Name", "Start Sector", "End Sector", "Size (GB)", "Max Size (GB)"]
+        h = ["Path", "Type", "Start Sector", "End Sector", "Size (GB)", "Max Size (GB)"]
         tabular = []
-        for part in self.partitions:
-            if "nvme" in self.dev_str:
-                part_str = "{}p{}".format(self.dev_str, part.part_num)
+        for idx, part in enumerate(self.partitions):
+            tabular.append(part.to_list(part.part_name))
+            if idx + 1 < len(self.partitions):
+                free = ((self.partitions[idx + 1].first_lba - part.first_lba - 1) * 512 / 2**30)
             else:
-                part_str = "{}{}".format(self.dev_str, part.part_num)
-            tabular.append(part.to_list(part_str))
+                free = ((self.last_lba - part.first_lba) * 512 / 2**30)
+            tabular[-1].append("{:.3f}".format(free))
+
         return tabulate.tabulate(tabular, headers=h, tablefmt="fancy_grid")
 
     def finish(self):
-        st = self.partCRC_calc[0]
+        st = g.partCRC_calc[0]
         for part in self.partitions:
-            self.table[st + (part.part_num - 1) * 128:st + + (part.part_num - 1) * 128 + 128] = part.finish()
-        self.table[self.partCRC[0]:self.partCRC[1]] = self.get_crc(self.table[self.partCRC_calc[0]:self.partCRC_calc[1]])
-        self.table[self.headerCRC[0]:self.headerCRC[1]] = self.get_crc(self.table[self.headerCRC_calc[0]:self.headerCRC_calc[1]])
+            self.table[st + (part.part_num - 1) * g.p_size:st + + (part.part_num - 1) * g.p_size + g.p_size] = part.finish()
+        self.table[g.partCRC[0]:g.partCRC[1]] = self.get_crc(self.table[g.partCRC_calc[0]:g.partCRC_calc[1]])
+        self.table[g.headerCRC[0]:g.headerCRC[1]] = self.get_crc(self.table[g.headerCRC_calc[0]:g.headerCRC_calc[1]])
         dev = os.open(self.dev_str, os.O_WRONLY)
         os.write(dev, self.table)
         # with open("dnm.out", "wb") as f:
@@ -179,18 +234,17 @@ def run_cmd_out(cmd):
 
 devices = run_cmd_out("lsblk --nodeps --noheadings --paths --output=NAME")
 gpt_dev = {}
-gpt = GPT("/dev/sda")
-gpt.make_partitions()
-gpt.partitions[0].set_lba(None, 10726591)
-gpt.finish()
+# gpt = GPT("/dev/sda")
+# gpt.make_partitions()
+# gpt.finish()
 
-# for d in devices:
-#     gpt = GPT(d)
-#     gpt.make_partitions()
-#     gpt_dev[d] = gpt
+for d in devices:
+    gpt = GPT(d)
+    gpt.make_partitions()
+    gpt_dev[d] = gpt
 
-# app = Pdisk(gpt_dev)
-# sys.exit(app.cmdloop())
+app = Pdisk(gpt_dev)
+sys.exit(app.cmdloop())
 
 # for i in gpt.partitions:
 #     print(i)
